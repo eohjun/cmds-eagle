@@ -2372,7 +2372,15 @@ var CMDSPACELinkEagle = class extends import_obsidian5.Plugin {
     console.log("[CMDS Eagle] Unloading plugin");
   }
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const saved = await this.loadData();
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+    if (saved == null ? void 0 : saved.cloudProviders) {
+      this.settings.cloudProviders = Object.assign(
+        {},
+        DEFAULT_SETTINGS.cloudProviders,
+        saved.cloudProviders
+      );
+    }
   }
   async saveSettings() {
     await this.saveData(this.settings);

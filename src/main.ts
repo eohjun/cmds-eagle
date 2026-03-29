@@ -162,7 +162,14 @@ export default class CMDSPACELinkEagle extends Plugin {
 	}
 
 	async loadSettings(): Promise<void> {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const saved = await this.loadData();
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, saved);
+		// Deep merge cloudProviders so new providers (e.g. googledrive) get defaults
+		if (saved?.cloudProviders) {
+			this.settings.cloudProviders = Object.assign(
+				{}, DEFAULT_SETTINGS.cloudProviders, saved.cloudProviders
+			);
+		}
 	}
 
 	async saveSettings(): Promise<void> {
