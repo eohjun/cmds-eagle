@@ -102,7 +102,7 @@ export type SupportedExtension =
 	| typeof SUPPORTED_VIDEO_EXTENSIONS[number]
 	| typeof SUPPORTED_DOCUMENT_EXTENSIONS[number];
 
-export type CloudProviderType = 'r2' | 's3' | 'webdav' | 'imghippo' | 'custom';
+export type CloudProviderType = 'r2' | 's3' | 'webdav' | 'imghippo' | 'custom' | 'googledrive';
 
 export type PlatformType = 'darwin' | 'win32';
 
@@ -162,7 +162,18 @@ export interface CustomProviderConfig extends CloudProviderConfig {
 	publicUrl: string;
 }
 
-export type AnyCloudProviderConfig = R2ProviderConfig | S3ProviderConfig | WebDAVProviderConfig | ImgHippoProviderConfig | CustomProviderConfig;
+export interface GoogleDriveProviderConfig extends CloudProviderConfig {
+	type: 'googledrive';
+	clientId: string;
+	clientSecret: string;
+	redirectPort: number;
+	driveFolder: string;
+	accessToken: string;
+	refreshToken: string;
+	tokenExpiresAt: number;
+}
+
+export type AnyCloudProviderConfig = R2ProviderConfig | S3ProviderConfig | WebDAVProviderConfig | ImgHippoProviderConfig | CustomProviderConfig | GoogleDriveProviderConfig;
 
 export interface CloudUploadResult {
 	success: boolean;
@@ -199,6 +210,7 @@ export interface CMDSPACEEagleSettings {
 		webdav: WebDAVProviderConfig;
 		imghippo: ImgHippoProviderConfig;
 		custom: CustomProviderConfig;
+		googledrive: GoogleDriveProviderConfig;
 	};
 	enableCrossPlatform: boolean;
 	autoConvertCrossPlatformPaths: boolean;
@@ -270,6 +282,18 @@ export const DEFAULT_SETTINGS: CMDSPACEEagleSettings = {
 			uploadUrl: '',
 			headers: {},
 			publicUrl: '',
+		},
+		googledrive: {
+			type: 'googledrive',
+			enabled: false,
+			name: 'Google Drive',
+			clientId: '',
+			clientSecret: '',
+			redirectPort: 42813,
+			driveFolder: 'Obsidian/Eagle',
+			accessToken: '',
+			refreshToken: '',
+			tokenExpiresAt: 0,
 		},
 	},
 	enableCrossPlatform: false,

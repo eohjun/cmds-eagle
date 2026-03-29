@@ -1,10 +1,12 @@
 import { App, PluginSettingTab, Setting, Notice } from 'obsidian';
 import CMDSPACELinkEagle from './main';
 import { EagleApiService } from './api';
-import { 
-	CloudProviderType, 
+import { GoogleDriveProvider } from './cloud-providers';
+import {
+	CloudProviderType,
 	ImagePasteBehavior,
 	SearchScope,
+	GoogleDriveProviderConfig,
 	SUPPORTED_IMAGE_EXTENSIONS,
 	SUPPORTED_VIDEO_EXTENSIONS,
 	SUPPORTED_DOCUMENT_EXTENSIONS,
@@ -105,6 +107,7 @@ export class CMDSPACEEagleSettingTab extends PluginSettingTab {
 			.setName('Active Cloud Provider')
 			.setDesc('Select which cloud storage to use for image uploads')
 			.addDropdown(dropdown => dropdown
+				.addOption('googledrive', 'Google Drive (Free)')
 				.addOption('r2', 'Cloudflare R2')
 				.addOption('imghippo', 'ImgHippo (Free)')
 				.addOption('s3', 'Amazon S3')
@@ -144,6 +147,9 @@ export class CMDSPACEEagleSettingTab extends PluginSettingTab {
 		const providerContainer = containerEl.createDiv({ cls: 'cloud-provider-settings' });
 
 		switch (provider) {
+			case 'googledrive':
+				this.renderGoogleDriveSettings(providerContainer);
+				break;
 			case 'imghippo':
 				this.renderImgHippoSettings(providerContainer);
 				break;
@@ -159,6 +165,140 @@ export class CMDSPACEEagleSettingTab extends PluginSettingTab {
 			case 'custom':
 				this.renderCustomSettings(providerContainer);
 				break;
+		}
+	}
+
+	private renderGoogleDriveSettings(containerEl: HTMLElement): void {
+		const gdConfig = this.plugin.settings.cloudProviders.googledrive;
+		containerEl.createEl('h4', { text: 'Google Drive Settings (Free)' });
+
+		const infoEl = containerEl.createEl('div', { cls: 'setting-item-description' });
+		infoEl.style.marginBottom = '12px';
+		infoEl.innerHTML = `
+			<p style="margin: 0 0 8px 0;">Google Drive provides 15GB free storage. Setup:</p>
+			<ol style="margin: 0; padding-left: 20px;">
+				<li>Go to <a href="https://console.cloud.google.com/apis/credentials" target="_blank">Google Cloud Console → Credentials</a></li>
+				<li>Create an OAuth 2.0 Client ID (Desktop app type)</li>
+				<li>Enable the <a href="https://console.cloud.google.com/apis/library/drive.googleapis.com" target="_blank">Google Drive API</a></li>
+				<li>Copy Client ID and Client Secret below, then click Authorize</li>
+			</ol>
+		`;
+
+		new Setting(containerEl)
+			.setName('Client ID')
+			.setDesc('OAuth 2.0 Client ID from Google Cloud Console')
+			.addText(text => text
+				.setPlaceholder('xxxxxxxxxx.apps.googleusercontent.com')
+				.setValue(gdConfig.clientId)
+				.onChange(async (value) => {
+					gdConfig.clientId = value.trim();
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Client Secret')
+			.setDesc('OAuth 2.0 Client Secret')
+			.addText(text => text
+				.setPlaceholder('GOCSPX-xxxxxxxxxx')
+				.setValue(gdConfig.clientSecret)
+				.onChange(async (value) => {
+					gdConfig.clientSecret = value.trim();
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Drive Folder')
+			.setDesc('Folder path in Google Drive for uploads')
+			.addText(text => text
+				.setPlaceholder('Obsidian/Eagle')
+				.setValue(gdConfig.driveFolder)
+				.onChange(async (value) => {
+					gdConfig.driveFolder = value.trim() || 'Obsidian/Eagle';
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('OAuth Redirect Port')
+			.setDesc('Local port for OAuth callback (change if default is in use)')
+			.addText(text => text
+				.setPlaceholder('42813')
+				.setValue(gdConfig.redirectPort.toString())
+				.onChange(async (value) => {
+					const num = parseInt(value, 10);
+					if (!isNaN(num) && num > 1024 && num < 65536) {
+						gdConfig.redirectPort = num;
+						await this.plugin.saveSettings();
+					}
+				}));
+
+		const isConnected = !!(gdConfig.accessToken && gdConfig.refreshToken);
+
+		if (isConnected) {
+			const statusEl = containerEl.createEl('div', { cls: 'setting-item-description' });
+			statusEl.style.marginBottom = '12px';
+			statusEl.style.padding = '8px 12px';
+			statusEl.style.background = 'var(--background-secondary)';
+			statusEl.style.borderRadius = '4px';
+			statusEl.style.borderLeft = '3px solid var(--interactive-accent)';
+			statusEl.innerHTML = '<strong>✓ Connected to Google Drive</strong>';
+
+			new Setting(containerEl)
+				.setName('Test Connection')
+				.setDesc('Verify Google Drive access')
+				.addButton(button => button
+					.setButtonText('Test')
+					.onClick(async () => {
+						const provider = new GoogleDriveProvider(gdConfig);
+						const result = await provider.testConnectionWithEmail();
+						if (result.connected) {
+							new Notice(`✓ Connected to Google Drive (${result.email || 'unknown'})`);
+						} else {
+							new Notice('✗ Connection failed. Try reconnecting.');
+						}
+					}));
+
+			new Setting(containerEl)
+				.setName('Disconnect')
+				.setDesc('Remove Google Drive authorization')
+				.addButton(button => button
+					.setButtonText('Disconnect')
+					.setWarning()
+					.onClick(async () => {
+						gdConfig.accessToken = '';
+						gdConfig.refreshToken = '';
+						gdConfig.tokenExpiresAt = 0;
+						gdConfig.enabled = false;
+						await this.plugin.saveSettings();
+						new Notice('Google Drive disconnected');
+						this.display();
+					}));
+		} else {
+			new Setting(containerEl)
+				.setName('Authorize')
+				.setDesc('Connect to Google Drive via OAuth')
+				.addButton(button => button
+					.setButtonText('Authorize with Google')
+					.setCta()
+					.onClick(async () => {
+						if (!gdConfig.clientId || !gdConfig.clientSecret) {
+							new Notice('✗ Please enter Client ID and Client Secret first');
+							return;
+						}
+						try {
+							const provider = new GoogleDriveProvider(gdConfig);
+							const tokens = await provider.authorize();
+							gdConfig.accessToken = tokens.accessToken;
+							gdConfig.refreshToken = tokens.refreshToken;
+							gdConfig.tokenExpiresAt = tokens.expiresAt;
+							gdConfig.enabled = true;
+							await this.plugin.saveSettings();
+							new Notice('✓ Google Drive connected!');
+							this.display();
+						} catch (error) {
+							const msg = error instanceof Error ? error.message : 'Unknown error';
+							new Notice(`✗ Authorization failed: ${msg}`);
+						}
+					}));
 		}
 	}
 

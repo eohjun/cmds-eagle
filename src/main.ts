@@ -27,7 +27,8 @@ import {
 } from './api';
 import { EagleSearchModal, ImagePasteChoiceModal } from './modals';
 import { CMDSPACEEagleSettingTab } from './settings';
-import { createCloudProvider, getMimeType, getExtFromFilename, CloudProvider } from './cloud-providers';
+import { createCloudProvider, getMimeType, getExtFromFilename, CloudProvider, GoogleDriveProvider } from './cloud-providers';
+import { GoogleDriveProviderConfig } from './types';
 
 export default class CMDSPACELinkEagle extends Plugin {
 	settings: CMDSPACEEagleSettings;
@@ -1033,7 +1034,7 @@ ${item.annotation ? `> | **Annotation** | ${item.annotation} |\n` : ''}${linkSec
 	private getActiveCloudProvider(): CloudProvider | null {
 		const providerType = this.settings.activeCloudProvider;
 		const config = this.settings.cloudProviders[providerType];
-		
+
 		if (!config || !config.enabled) {
 			if (this.settings.r2WorkerUrl && this.settings.r2ApiKey) {
 				return createCloudProvider({
@@ -1046,6 +1047,16 @@ ${item.annotation ? `> | **Annotation** | ${item.annotation} |\n` : ''}${linkSec
 				});
 			}
 			return null;
+		}
+
+		if (providerType === 'googledrive') {
+			return new GoogleDriveProvider(
+				config as GoogleDriveProviderConfig,
+				async (updatedConfig: GoogleDriveProviderConfig) => {
+					this.settings.cloudProviders.googledrive = updatedConfig;
+					await this.saveSettings();
+				}
+			);
 		}
 
 		return createCloudProvider(config);

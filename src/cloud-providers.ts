@@ -1,4 +1,8 @@
 import { promises as fs } from 'fs';
+import { requestUrl, Notice, Platform } from 'obsidian';
+import { shell } from 'electron';
+import * as http from 'http';
+import * as url from 'url';
 import {
 	CloudUploadResult,
 	R2ProviderConfig,
@@ -6,6 +10,7 @@ import {
 	WebDAVProviderConfig,
 	ImgHippoProviderConfig,
 	CustomProviderConfig,
+	GoogleDriveProviderConfig,
 	AnyCloudProviderConfig,
 } from './types';
 
@@ -480,6 +485,462 @@ export class CustomProvider implements CloudProvider {
 	}
 }
 
+export class GoogleDriveProvider implements CloudProvider {
+	private static readonly AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
+	private static readonly TOKEN_URL = 'https://oauth2.googleapis.com/token';
+	private static readonly API_URL = 'https://www.googleapis.com/drive/v3';
+	private static readonly UPLOAD_URL = 'https://www.googleapis.com/upload/drive/v3';
+	private static readonly SCOPES = [
+		'https://www.googleapis.com/auth/drive.file',
+		'https://www.googleapis.com/auth/userinfo.email'
+	];
+
+	private server: http.Server | null = null;
+	private timeoutId: ReturnType<typeof setTimeout> | null = null;
+	private folderIdCache = new Map<string, string>();
+
+	constructor(
+		private config: GoogleDriveProviderConfig,
+		private onConfigUpdate?: (config: GoogleDriveProviderConfig) => Promise<void>
+	) {}
+
+	async upload(filePath: string, filename: string, mimeType: string): Promise<CloudUploadResult> {
+		if (!this.config.accessToken || !this.config.refreshToken) {
+			return { success: false, error: 'Google Drive not authorized. Please connect in settings.' };
+		}
+
+		try {
+			const fileBuffer = await fs.readFile(filePath);
+			const base64Data = Buffer.from(fileBuffer).toString('base64');
+
+			const accessToken = await this.ensureValidToken();
+			const folderId = await this.ensureFolder(this.config.driveFolder);
+
+			const metadata = {
+				name: filename,
+				mimeType: mimeType,
+				parents: [folderId]
+			};
+
+			const boundary = '-------314159265358979323846';
+			const delimiter = `\r\n--${boundary}\r\n`;
+			const closeDelimiter = `\r\n--${boundary}--`;
+
+			const multipartBody =
+				delimiter +
+				'Content-Type: application/json\r\n\r\n' +
+				JSON.stringify(metadata) +
+				delimiter +
+				`Content-Type: ${mimeType}\r\n` +
+				'Content-Transfer-Encoding: base64\r\n\r\n' +
+				base64Data +
+				closeDelimiter;
+
+			const uploadResponse = await requestUrl({
+				url: `${GoogleDriveProvider.UPLOAD_URL}/files?uploadType=multipart&fields=id,name,mimeType`,
+				method: 'POST',
+				headers: {
+					'Authorization': `Bearer ${accessToken}`,
+					'Content-Type': `multipart/related; boundary=${boundary}`
+				},
+				body: multipartBody
+			});
+
+			if (uploadResponse.status !== 200) {
+				return { success: false, error: `Drive upload failed: ${uploadResponse.status}` };
+			}
+
+			const fileData = uploadResponse.json;
+			if (!fileData?.id) {
+				return { success: false, error: 'Upload response missing file ID' };
+			}
+
+			const fileId = fileData.id as string;
+
+			await this.makeFilePublic(fileId, accessToken);
+			const fileInfo = await this.getFileInfo(fileId, accessToken);
+
+			const publicUrl = fileInfo.webContentLink
+				|| `https://drive.google.com/uc?export=view&id=${fileId}`;
+
+			return {
+				success: true,
+				key: fileId,
+				filename: filename,
+				publicUrl: publicUrl,
+			};
+		} catch (error) {
+			return {
+				success: false,
+				error: error instanceof Error ? error.message : 'Unknown error'
+			};
+		}
+	}
+
+	async testConnection(): Promise<boolean> {
+		if (!this.config.accessToken) return false;
+		try {
+			const accessToken = await this.ensureValidToken();
+			const response = await requestUrl({
+				url: `${GoogleDriveProvider.API_URL}/about?fields=user`,
+				method: 'GET',
+				headers: { 'Authorization': `Bearer ${accessToken}` }
+			});
+			return response.status === 200;
+		} catch {
+			return false;
+		}
+	}
+
+	async testConnectionWithEmail(): Promise<{ connected: boolean; email?: string }> {
+		if (!this.config.accessToken) return { connected: false };
+		try {
+			const accessToken = await this.ensureValidToken();
+			const response = await requestUrl({
+				url: `${GoogleDriveProvider.API_URL}/about?fields=user`,
+				method: 'GET',
+				headers: { 'Authorization': `Bearer ${accessToken}` }
+			});
+			if (response.status === 200) {
+				return { connected: true, email: response.json?.user?.emailAddress };
+			}
+			return { connected: false };
+		} catch {
+			return { connected: false };
+		}
+	}
+
+	getPublicUrl(key: string): string {
+		return `https://drive.google.com/uc?export=view&id=${key}`;
+	}
+
+	isConnected(): boolean {
+		return !!(this.config.accessToken && this.config.refreshToken);
+	}
+
+	disconnect(): void {
+		this.config.accessToken = '';
+		this.config.refreshToken = '';
+		this.config.tokenExpiresAt = 0;
+		this.folderIdCache.clear();
+	}
+
+	async authorize(): Promise<{ accessToken: string; refreshToken: string; expiresAt: number }> {
+		if (!Platform.isDesktop) {
+			throw new Error('Google Drive authorization requires the desktop app.');
+		}
+		if (!this.config.clientId || !this.config.clientSecret) {
+			throw new Error('Please enter Client ID and Client Secret first.');
+		}
+
+		const codeVerifier = this.generateCodeVerifier();
+		const codeChallenge = await this.generateCodeChallenge(codeVerifier);
+		const redirectUri = `http://localhost:${this.config.redirectPort}/callback`;
+
+		return new Promise((resolve, reject) => {
+			try {
+				this.server = http.createServer(async (req, res) => {
+					try {
+						const parsedUrl = url.parse(req.url || '', true);
+						if (parsedUrl.pathname !== '/callback') return;
+
+						const code = parsedUrl.query.code as string;
+						const oauthError = parsedUrl.query.error as string;
+
+						if (oauthError) {
+							res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+							res.end(this.getResultHtml(false, oauthError));
+							this.cleanupServer();
+							reject(new Error(`OAuth error: ${oauthError}`));
+							return;
+						}
+
+						if (code) {
+							try {
+								const tokens = await this.exchangeCodeForTokens(code, codeVerifier, redirectUri);
+								res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+								res.end(this.getResultHtml(true));
+								this.cleanupServer();
+								resolve(tokens);
+							} catch (tokenError) {
+								const msg = tokenError instanceof Error ? tokenError.message : String(tokenError);
+								res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+								res.end(this.getResultHtml(false, msg));
+								this.cleanupServer();
+								reject(new Error(`Token exchange failed: ${msg}`));
+							}
+						}
+					} catch (err) {
+						reject(err instanceof Error ? err : new Error(String(err)));
+					}
+				});
+
+				this.server.listen(this.config.redirectPort);
+
+				this.server.on('error', (err: NodeJS.ErrnoException) => {
+					if (err.code === 'EADDRINUSE') {
+						reject(new Error(`Port ${this.config.redirectPort} is in use. Change the OAuth port in settings.`));
+					} else {
+						reject(err);
+					}
+				});
+
+				const params = new URLSearchParams({
+					client_id: this.config.clientId,
+					redirect_uri: redirectUri,
+					response_type: 'code',
+					scope: GoogleDriveProvider.SCOPES.join(' '),
+					access_type: 'offline',
+					prompt: 'consent',
+					code_challenge: codeChallenge,
+					code_challenge_method: 'S256'
+				});
+				const authUrl = `${GoogleDriveProvider.AUTH_URL}?${params.toString()}`;
+
+				new Notice('Please log in with Google in your browser...', 3000);
+				void shell.openExternal(authUrl);
+
+				this.timeoutId = setTimeout(() => {
+					this.cleanupServer();
+					reject(new Error('OAuth flow timed out (2 min). Please try again.'));
+				}, 120000);
+			} catch (error) {
+				this.cleanupServer();
+				reject(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+	}
+
+	// ── Token management ────────────────────────────────
+
+	private async ensureValidToken(): Promise<string> {
+		if (this.config.tokenExpiresAt && this.config.refreshToken) {
+			const bufferTime = 5 * 60 * 1000;
+			if (Date.now() >= (this.config.tokenExpiresAt - bufferTime)) {
+				const newTokens = await this.refreshAccessToken(this.config.refreshToken);
+				this.config.accessToken = newTokens.accessToken;
+				this.config.tokenExpiresAt = newTokens.expiresAt;
+				if (this.onConfigUpdate) {
+					await this.onConfigUpdate(this.config);
+				}
+			}
+		}
+
+		if (!this.config.accessToken) {
+			throw new Error('Not connected to Google Drive. Please connect in settings.');
+		}
+
+		return this.config.accessToken;
+	}
+
+	private async refreshAccessToken(refreshToken: string): Promise<{ accessToken: string; expiresAt: number }> {
+		const response = await requestUrl({
+			url: GoogleDriveProvider.TOKEN_URL,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams({
+				client_id: this.config.clientId,
+				client_secret: this.config.clientSecret,
+				refresh_token: refreshToken,
+				grant_type: 'refresh_token'
+			}).toString()
+		});
+
+		if (response.status !== 200) {
+			throw new Error(`Token refresh failed (${response.status})`);
+		}
+
+		const data = response.json;
+		return {
+			accessToken: data.access_token,
+			expiresAt: Date.now() + (data.expires_in * 1000),
+		};
+	}
+
+	private async exchangeCodeForTokens(
+		code: string, codeVerifier: string, redirectUri: string
+	): Promise<{ accessToken: string; refreshToken: string; expiresAt: number }> {
+		const response = await requestUrl({
+			url: GoogleDriveProvider.TOKEN_URL,
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams({
+				code,
+				client_id: this.config.clientId,
+				client_secret: this.config.clientSecret,
+				redirect_uri: redirectUri,
+				grant_type: 'authorization_code',
+				code_verifier: codeVerifier
+			}).toString(),
+			throw: false
+		});
+
+		if (response.status !== 200) {
+			const errorDesc = response.json?.error_description || response.json?.error || `status ${response.status}`;
+			throw new Error(`Token exchange failed: ${errorDesc}`);
+		}
+
+		const data = response.json;
+		return {
+			accessToken: data.access_token,
+			refreshToken: data.refresh_token,
+			expiresAt: Date.now() + (data.expires_in * 1000),
+		};
+	}
+
+	// ── Drive folder management ─────────────────────────
+
+	private async ensureFolder(folderPath: string): Promise<string> {
+		const parts = folderPath.split('/').filter(p => p.length > 0);
+		let parentId = 'root';
+		let cumulativePath = '';
+
+		for (const folderName of parts) {
+			cumulativePath += '/' + folderName;
+
+			const cached = this.folderIdCache.get(cumulativePath);
+			if (cached) {
+				parentId = cached;
+				continue;
+			}
+
+			const existingId = await this.findFolder(folderName, parentId);
+			if (existingId) {
+				parentId = existingId;
+			} else {
+				parentId = await this.createFolder(folderName, parentId);
+			}
+
+			this.folderIdCache.set(cumulativePath, parentId);
+		}
+
+		return parentId;
+	}
+
+	private async findFolder(name: string, parentId: string): Promise<string | null> {
+		try {
+			const accessToken = await this.ensureValidToken();
+			const escapedName = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+			const query = `name='${escapedName}' and '${parentId}' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false`;
+
+			const response = await requestUrl({
+				url: `${GoogleDriveProvider.API_URL}/files?q=${encodeURIComponent(query)}&fields=files(id)`,
+				method: 'GET',
+				headers: { 'Authorization': `Bearer ${accessToken}` }
+			});
+
+			if (response.status === 200) {
+				const data = response.json;
+				if (data.files?.length > 0 && data.files[0].id) {
+					return data.files[0].id;
+				}
+			}
+			return null;
+		} catch {
+			return null;
+		}
+	}
+
+	private async createFolder(name: string, parentId: string): Promise<string> {
+		const accessToken = await this.ensureValidToken();
+
+		const response = await requestUrl({
+			url: `${GoogleDriveProvider.API_URL}/files`,
+			method: 'POST',
+			headers: {
+				'Authorization': `Bearer ${accessToken}`,
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify({
+				name,
+				mimeType: 'application/vnd.google-apps.folder',
+				parents: [parentId]
+			})
+		});
+
+		if (response.status !== 200) {
+			throw new Error(`Folder creation failed: ${response.status}`);
+		}
+
+		return response.json.id;
+	}
+
+	private async makeFilePublic(fileId: string, accessToken: string): Promise<void> {
+		try {
+			await requestUrl({
+				url: `${GoogleDriveProvider.API_URL}/files/${fileId}/permissions`,
+				method: 'POST',
+				headers: {
+					'Authorization': `Bearer ${accessToken}`,
+					'Content-Type': 'application/json'
+				},
+				body: JSON.stringify({ role: 'reader', type: 'anyone' })
+			});
+		} catch (error) {
+			console.error('[cmds-eagle] Failed to make file public:', error);
+		}
+	}
+
+	private async getFileInfo(fileId: string, accessToken: string): Promise<{ webViewLink?: string; webContentLink?: string }> {
+		try {
+			const response = await requestUrl({
+				url: `${GoogleDriveProvider.API_URL}/files/${fileId}?fields=webViewLink,webContentLink`,
+				method: 'GET',
+				headers: { 'Authorization': `Bearer ${accessToken}` }
+			});
+			return response.json as { webViewLink?: string; webContentLink?: string };
+		} catch {
+			return {};
+		}
+	}
+
+	// ── PKCE helpers ────────────────────────────────────
+
+	private generateCodeVerifier(): string {
+		const array = new Uint8Array(32);
+		crypto.getRandomValues(array);
+		return this.base64UrlEncode(array);
+	}
+
+	private async generateCodeChallenge(verifier: string): Promise<string> {
+		const data = new TextEncoder().encode(verifier);
+		const hash = await crypto.subtle.digest('SHA-256', data);
+		return this.base64UrlEncode(new Uint8Array(hash));
+	}
+
+	private base64UrlEncode(buffer: Uint8Array): string {
+		let binary = '';
+		for (let i = 0; i < buffer.length; i++) {
+			binary += String.fromCharCode(buffer[i]);
+		}
+		return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+	}
+
+	// ── Utilities ───────────────────────────────────────
+
+	private cleanupServer(): void {
+		if (this.timeoutId) {
+			clearTimeout(this.timeoutId);
+			this.timeoutId = null;
+		}
+		if (this.server) {
+			this.server.close();
+			this.server = null;
+		}
+	}
+
+	private getResultHtml(success: boolean, error?: string): string {
+		if (success) {
+			return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>CMDS Eagle - Google Drive Connected</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:linear-gradient(135deg,#4285f4,#34a853)}.c{background:#fff;padding:40px 60px;border-radius:16px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.2)}</style>
+</head><body><div class="c"><div style="font-size:64px">✅</div><h1>Connected!</h1><p>Google Drive is connected. You can close this window.</p></div></body></html>`;
+		}
+		return `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>CMDS Eagle - Connection Failed</title>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:linear-gradient(135deg,#ea4335,#fbbc05)}.c{background:#fff;padding:40px 60px;border-radius:16px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.2)}.e{background:#fff3f3;border:1px solid #fcc;padding:10px 20px;border-radius:8px;color:#c00;font-family:monospace}</style>
+</head><body><div class="c"><div style="font-size:64px">❌</div><h1>Failed</h1><div class="e">${error || 'Unknown error'}</div><p>Please try again in Obsidian.</p></div></body></html>`;
+	}
+}
+
 export function createCloudProvider(config: AnyCloudProviderConfig): CloudProvider | null {
 	switch (config.type) {
 		case 'r2':
@@ -492,6 +953,8 @@ export function createCloudProvider(config: AnyCloudProviderConfig): CloudProvid
 			return new ImgHippoProvider(config as ImgHippoProviderConfig);
 		case 'custom':
 			return new CustomProvider(config as CustomProviderConfig);
+		case 'googledrive':
+			return new GoogleDriveProvider(config as GoogleDriveProviderConfig);
 		default:
 			return null;
 	}
