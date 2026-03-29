@@ -516,8 +516,11 @@ export class GoogleDriveProvider implements CloudProvider {
 			const accessToken = await this.ensureValidToken();
 			const folderId = await this.ensureFolder(this.config.driveFolder);
 
+			// Add timestamp to generic filenames (e.g. clipboard paste "image.png")
+			const timestampedFilename = this.makeUniqueFilename(filename);
+
 			const metadata = {
-				name: filename,
+				name: timestampedFilename,
 				mimeType: mimeType,
 				parents: [folderId]
 			};
@@ -558,15 +561,14 @@ export class GoogleDriveProvider implements CloudProvider {
 			const fileId = fileData.id as string;
 
 			await this.makeFilePublic(fileId, accessToken);
-			const fileInfo = await this.getFileInfo(fileId, accessToken);
 
-			const publicUrl = fileInfo.webContentLink
-				|| `https://drive.google.com/uc?export=view&id=${fileId}`;
+			// Use thumbnail API — serves image directly without redirect, works in Obsidian markdown
+			const publicUrl = `https://drive.google.com/thumbnail?id=${fileId}&sz=w2000`;
 
 			return {
 				success: true,
 				key: fileId,
-				filename: filename,
+				filename: timestampedFilename,
 				publicUrl: publicUrl,
 			};
 		} catch (error) {
@@ -611,7 +613,7 @@ export class GoogleDriveProvider implements CloudProvider {
 	}
 
 	getPublicUrl(key: string): string {
-		return `https://drive.google.com/uc?export=view&id=${key}`;
+		return `https://drive.google.com/thumbnail?id=${key}&sz=w2000`;
 	}
 
 	isConnected(): boolean {
@@ -881,19 +883,6 @@ export class GoogleDriveProvider implements CloudProvider {
 		}
 	}
 
-	private async getFileInfo(fileId: string, accessToken: string): Promise<{ webViewLink?: string; webContentLink?: string }> {
-		try {
-			const response = await requestUrl({
-				url: `${GoogleDriveProvider.API_URL}/files/${fileId}?fields=webViewLink,webContentLink`,
-				method: 'GET',
-				headers: { 'Authorization': `Bearer ${accessToken}` }
-			});
-			return response.json as { webViewLink?: string; webContentLink?: string };
-		} catch {
-			return {};
-		}
-	}
-
 	// ── PKCE helpers ────────────────────────────────────
 
 	private generateCodeVerifier(): string {
@@ -917,6 +906,20 @@ export class GoogleDriveProvider implements CloudProvider {
 	}
 
 	// ── Utilities ───────────────────────────────────────
+
+	private makeUniqueFilename(filename: string): string {
+		const dot = filename.lastIndexOf('.');
+		const name = dot > 0 ? filename.slice(0, dot) : filename;
+		const ext = dot > 0 ? filename.slice(dot) : '';
+		const now = new Date();
+		const ts = now.getFullYear().toString()
+			+ (now.getMonth() + 1).toString().padStart(2, '0')
+			+ now.getDate().toString().padStart(2, '0')
+			+ now.getHours().toString().padStart(2, '0')
+			+ now.getMinutes().toString().padStart(2, '0')
+			+ now.getSeconds().toString().padStart(2, '0');
+		return `${name}_${ts}${ext}`;
+	}
 
 	private cleanupServer(): void {
 		if (this.timeoutId) {

@@ -1326,8 +1326,9 @@ var _GoogleDriveProvider = class {
       const base64Data = Buffer.from(fileBuffer).toString("base64");
       const accessToken = await this.ensureValidToken();
       const folderId = await this.ensureFolder(this.config.driveFolder);
+      const timestampedFilename = this.makeUniqueFilename(filename);
       const metadata = {
-        name: filename,
+        name: timestampedFilename,
         mimeType,
         parents: [folderId]
       };
@@ -1359,12 +1360,11 @@ Content-Transfer-Encoding: base64\r
       }
       const fileId = fileData.id;
       await this.makeFilePublic(fileId, accessToken);
-      const fileInfo = await this.getFileInfo(fileId, accessToken);
-      const publicUrl = fileInfo.webContentLink || `https://drive.google.com/uc?export=view&id=${fileId}`;
+      const publicUrl = `https://drive.google.com/thumbnail?id=${fileId}&sz=w2000`;
       return {
         success: true,
         key: fileId,
-        filename,
+        filename: timestampedFilename,
         publicUrl
       };
     } catch (error) {
@@ -1409,7 +1409,7 @@ Content-Transfer-Encoding: base64\r
     }
   }
   getPublicUrl(key) {
-    return `https://drive.google.com/uc?export=view&id=${key}`;
+    return `https://drive.google.com/thumbnail?id=${key}&sz=w2000`;
   }
   isConnected() {
     return !!(this.config.accessToken && this.config.refreshToken);
@@ -1641,18 +1641,6 @@ Content-Transfer-Encoding: base64\r
       console.error("[cmds-eagle] Failed to make file public:", error);
     }
   }
-  async getFileInfo(fileId, accessToken) {
-    try {
-      const response = await (0, import_obsidian3.requestUrl)({
-        url: `${_GoogleDriveProvider.API_URL}/files/${fileId}?fields=webViewLink,webContentLink`,
-        method: "GET",
-        headers: { "Authorization": `Bearer ${accessToken}` }
-      });
-      return response.json;
-    } catch (e) {
-      return {};
-    }
-  }
   // ── PKCE helpers ────────────────────────────────────
   generateCodeVerifier() {
     const array = new Uint8Array(32);
@@ -1672,6 +1660,14 @@ Content-Transfer-Encoding: base64\r
     return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
   // ── Utilities ───────────────────────────────────────
+  makeUniqueFilename(filename) {
+    const dot = filename.lastIndexOf(".");
+    const name = dot > 0 ? filename.slice(0, dot) : filename;
+    const ext = dot > 0 ? filename.slice(dot) : "";
+    const now = new Date();
+    const ts = now.getFullYear().toString() + (now.getMonth() + 1).toString().padStart(2, "0") + now.getDate().toString().padStart(2, "0") + now.getHours().toString().padStart(2, "0") + now.getMinutes().toString().padStart(2, "0") + now.getSeconds().toString().padStart(2, "0");
+    return `${name}_${ts}${ext}`;
+  }
   cleanupServer() {
     if (this.timeoutId) {
       clearTimeout(this.timeoutId);
